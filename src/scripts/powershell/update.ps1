@@ -38,6 +38,7 @@ function Set-Status {
         "s" { Write-Host "[+] $Message" -ForegroundColor Green }
         "f" { Write-Host "[-] $Message" -ForegroundColor Red }
         "q" { Write-Host "[?] $Message" -ForegroundColor Magenta }
+        "w" { Write-Host "[!] $Message" -ForegroundColor Yellow }
         default { Write-Host "[*] $Message" -ForegroundColor Cyan }
     }
 }
@@ -52,6 +53,40 @@ function Run-Command {
     Set-Status $BeforeText "s"
     & $CommandToRun
     Set-Status $AfterText "s"
+}
+
+function Test-PendingReboot {
+    # Check known Windows indicators that flag a pending reboot
+    $pendingRegistryPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+
+    foreach ($path in $pendingRegistryPaths) {
+        if (Test-Path $path) {
+            return $true
+        }
+    }
+
+    $pendingFileRename = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pendingFileRename) {
+        return $true
+    }
+
+    $wuRebootCmd = Get-Command Get-WURebootStatus -ErrorAction SilentlyContinue
+    if ($wuRebootCmd) {
+        try {
+            $wuRebootStatus = & $wuRebootCmd
+            if ($wuRebootStatus -and ($wuRebootStatus.RebootRequired -or $wuRebootStatus.Reboot)) {
+                return $true
+            }
+        }
+        catch {
+            # Ignore errors from optional PSWindowsUpdate helper
+        }
+    }
+
+    return $false
 }
 
 Write-Host "$Name $Version" -ForegroundColor Magenta
@@ -86,17 +121,40 @@ Run-Command "STEP 2 of 4: Upgrading Winget packages..." "Winget packages upgrade
 }
 
 # Chocolatey Upgrade
-Run-Command "STEP 3 of 4: Upgrading Chocolatey packages..." "Chocolatey packages upgraded." {
-    choco upgrade all -y
+$ChocoCommand = Get-Command choco -ErrorAction SilentlyContinue
+if ($ChocoCommand) {
+    Run-Command "STEP 3 of 4: Upgrading Chocolatey packages..." "Chocolatey packages upgraded." {
+        choco upgrade all -y
+    }
+}
+else {
+    Set-Status "STEP 3 of 4: Upgrading Chocolatey packages..." "s"
+    Set-Status "Chocolatey is not installed on this system. Install it from https://chocolatey.org/install if desired." "w"
 }
 
 # Windows Update
-Run-Command "STEP 4 of 4: Checking for Windows Updates..." "Windows updates checked." {
-    Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot
+$PsWindowsUpdateModule = Get-Module -ListAvailable -Name PSWindowsUpdate
+if (-not $PsWindowsUpdateModule) {
+    Set-Status "STEP 4 of 4: Checking for Windows Updates..." "s"
+    Set-Status "The PSWindowsUpdate module is not installed. Install it with 'Install-Module -Name PSWindowsUpdate -Scope CurrentUser' and re-run this step." "w"
+}
+else {
+    try {
+        if (-not (Get-Module -Name PSWindowsUpdate)) {
+            Import-Module -Name PSWindowsUpdate -Force -ErrorAction Stop
+        }
+
+        Run-Command "STEP 4 of 4: Checking for Windows Updates..." "Windows updates checked." {
+            Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot
+        }
+    }
+    catch {
+        Set-Status "STEP 4 of 4: Failed to load PSWindowsUpdate module. $_" "f"
+    }
 }
 
 # Restart if Required
-if (Get-ComputerInfo -Property CsRequiresManualRestart) {
+if (Test-PendingReboot) {
     Set-Status "A restart is required. Would you like to restart now? [y/n]" "q"
     $Choice = Read-Host "> "
     switch ($Choice.ToLower()) {
